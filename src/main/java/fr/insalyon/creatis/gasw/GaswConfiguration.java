@@ -40,6 +40,13 @@ import java.net.URI;
 import java.net.URISyntaxException;
 import java.util.List;
 import java.util.ArrayList;
+import java.util.Map;
+import java.util.AbstractMap;
+import java.util.Collection;
+import java.util.stream.Collectors;
+
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 
 import org.apache.commons.configuration.ConfigurationException;
 import org.apache.commons.configuration.PropertiesConfiguration;
@@ -71,10 +78,11 @@ import net.xeoh.plugins.base.util.PluginManagerUtil;
 public class GaswConfiguration {
 
     private static final Logger logger = LoggerFactory.getLogger(GaswConfiguration.class);
-    private static final String configDir = "./conf";
     private static final String configFile = "settings.conf";
     private static GaswConfiguration instance;
     private static boolean strict = true;
+
+    private String configDir = "./conf";
     private PropertiesConfiguration config;
     private PluginManager pm;
     // Properties
@@ -90,8 +98,7 @@ public class GaswConfiguration {
     private int defaultSleeptime;
     private int defaultCPUTime;
     // Fallback Properties
-    private int fallbackRetryThreshold;
-    private List<String> fallbackResources;
+    private List<AbstractMap.SimpleEntry<String, String>> fallbackResources;
     // Virtual Organization
     private String voName;
     private String voDefaultSE;
@@ -140,9 +147,16 @@ public class GaswConfiguration {
     }
 
     private GaswConfiguration() throws GaswException {
+        loadConfig();
+    }
+
+    private void loadConfig() throws GaswException {
         loadConfigurationFile();
         loadPlugins();
+    }
 
+    public void initializeRuntime() throws GaswException {
+        loadHibernate();
         if (failOverEnabled) {
             loadSEEntryPoints();
         }
@@ -163,7 +177,6 @@ public class GaswConfiguration {
             defaultTimeout = config.getInt(GaswConstants.LAB_DEFAULT_TIMEOUT, 100000);
             defaultSleeptime = config.getInt(GaswConstants.LAB_DEFAULT_SLEEPTIME, 20) * 1000;
             defaultCPUTime = config.getInt(GaswConstants.LAB_DEFAULT_CPUTIME, 1800);
-            fallbackRetryThreshold = config.getInt(GaswConstants.LAB_FALLBACK_RETRY_THRESHOLD, 3);
             fallbackResources = loadFallbackResources(config);
 
             voName = config.getString(GaswConstants.LAB_VO_NAME, "biomed");
@@ -206,7 +219,6 @@ public class GaswConfiguration {
             config.setProperty(GaswConstants.LAB_DEFAULT_TIMEOUT, defaultTimeout);
             config.setProperty(GaswConstants.LAB_DEFAULT_SLEEPTIME, defaultSleeptime / 1000);
             config.setProperty(GaswConstants.LAB_DEFAULT_CPUTIME, defaultCPUTime);
-            config.setProperty(GaswConstants.LAB_FALLBACK_RETRY_THRESHOLD, fallbackRetryThreshold);
 
             config.setProperty(GaswConstants.LAB_VO_NAME, voName);
             config.setProperty(GaswConstants.LAB_VO_DEFAULT_SE, voDefaultSE);
@@ -248,17 +260,32 @@ public class GaswConfiguration {
         }
     }
 
-    private List<String> loadFallbackResources(PropertiesConfiguration config) {
-        List<Object> resourcesList = config.getList(GaswConstants.LAB_FALLBACK_RESOURCES, new ArrayList<>());
-        List<String> resources = new ArrayList<>();
-        for (Object obj : resourcesList) {
-            if (obj == null) continue;
+    private List<AbstractMap.SimpleEntry<String, String>> loadFallbackResources(PropertiesConfiguration config) {
+        Object raw = config.getProperty(GaswConstants.LAB_FALLBACK_RESOURCES);
+        // Reconstruct the JSON
+        String json = raw instanceof Collection<?> ? ((Collection<?>) raw).stream()
+                .map(String::valueOf)
+                .collect(Collectors.joining(","))
+                : raw == null ? "" : raw.toString();
 
-            resources.add(obj.toString());
+        if (json.isBlank()) {
+            return new ArrayList<>();
         }
 
-        logger.info("Loaded fallback resources: {}", resources);
-        return resources;
+        try {
+            ObjectMapper mapper = new ObjectMapper();
+            List<Map<String, String>> parsed = mapper.readValue(json, new TypeReference<List<Map<String, String>>>() {});
+            List<AbstractMap.SimpleEntry<String, String>> fallbackResources = new ArrayList<>();
+            for (Map<String, String> entry : parsed) {
+                entry.forEach((key, value) -> fallbackResources.add(new AbstractMap.SimpleEntry<>(key, value)));
+            }
+
+            logger.info("Loaded fallback resources: {}", fallbackResources);
+            return fallbackResources;
+        } catch (Exception e) {
+            logger.warn("Failed to parse resources as JSON", e);
+            return new ArrayList<>();
+        }
     }
 
     private void loadPlugins() throws GaswException {
@@ -291,7 +318,7 @@ public class GaswConfiguration {
         return pluginUri;
     }
 
-    public void loadHibernate() throws GaswException {
+    private void loadHibernate() throws GaswException {
         logger.info("Loading database plugin '{}'.", dbPlugin.getName());
         dbPlugin.load();
 
@@ -380,6 +407,16 @@ public class GaswConfiguration {
         }
     }
 
+    public void reloadGasw(String newConfigPath) throws GaswException {
+        try {
+            setConfigDir(newConfigPath);
+            loadConfig();
+            initializeRuntime();
+        } catch (GaswException ex) {
+            throw new GaswException("Error reloading configuration", ex);
+        }
+    }
+
     public void terminate(boolean force) throws GaswException {
 
         for (ExecutorPlugin executorPlugin : executorPlugins) {
@@ -389,7 +426,11 @@ public class GaswConfiguration {
             listenerPlugin.terminate();
         }
         pm.shutdown();
-        sessionFactory.close();
+        try {
+            DAOFactory.getDAOFactory().close();
+        } catch (DAOException ex) {
+            logger.error("Error closing DAO factory:", ex);
+        }
     }
 
     public PropertiesConfiguration getPropertiesConfiguration() {
@@ -428,9 +469,15 @@ public class GaswConfiguration {
         return defaultCPUTime;
     }
 
-    public int getFallbackRetryThreshold() { return fallbackRetryThreshold; }
+    public List<AbstractMap.SimpleEntry<String, String>> getFallbackResources() { return fallbackResources; }
 
-    public List<String> getFallbackResources() { return fallbackResources; }
+    public void setFallbackResources(List<AbstractMap.SimpleEntry<String, String>> fallbackResources) {
+        this.fallbackResources = fallbackResources;
+    }
+
+    public String getConfigDir() {
+        return configDir;
+    }
 
     public String getDefaultEnvironment() {
         return defaultEnvironment;
@@ -524,4 +571,8 @@ public class GaswConfiguration {
     public String getContainersRuntimeEncryptedKey() {
         return containersRuntimeEncryptedKey;
         }
+
+    public void setConfigDir(String configDir) {
+        this.configDir = configDir;
+    }
 }
